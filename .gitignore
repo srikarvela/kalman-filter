@@ -6,6 +6,7 @@ chisel/target/
 chisel/project/target/
 chisel/project/project/
 chisel/generated/
+chisel/test_run_dir/
 
 # Vivado project output
 vivado/
