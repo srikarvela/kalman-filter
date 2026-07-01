@@ -2,7 +2,7 @@ ThisBuild / scalaVersion     := "2.13.12"
 ThisBuild / version          := "0.1.0"
 ThisBuild / organization     := "com.fpga-crypto"
 
-val chiselVersion = "3.6.0"
+val chiselVersion = "3.6.1" // 3.6.0's chisel3-plugin isn't published for scalaVersion 2.13.12; 3.6.1 is.
 
 lazy val root = (project in file("."))
   .settings(
