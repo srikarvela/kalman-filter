@@ -1,0 +1,23 @@
+# Claude Code local settings
+.claude/
+
+# Chisel / SBT build artifacts
+chisel/target/
+chisel/project/target/
+chisel/project/project/
+chisel/generated/
+
+# Vivado project output
+vivado/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Generated vectors (reproducible via `make kf-golden`)
+vectors/*.csv
+
+# macOS
+.DS_Store
