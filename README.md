@@ -1,5 +1,7 @@
 # Fixed-Point Kalman Filter FPGA (Chisel)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A fixed-point Kalman filter for HFT mid-price estimation, built entirely in RTL — no HLS. It's designed as a downstream signal-smoothing stage for the [fpga-crypto-feed-handler](../../EE%20Hardware/fpga-crypto-feed-handler) order book: take its noisy `midprice` output and produce a smoothed price estimate plus a live drift (momentum) estimate, in hardware, with no software in the loop.
 
 Where the order book project is a stream-processing design (single-cycle updates, always-ready AXI-Stream), this project is deliberately different: a **recursive, loop-carried** filter built around real pipelined matrix-multiply hardware and a division-free Newton-Raphson reciprocal — the two pieces of arithmetic hardware most FPGA "Kalman filter" toy examples skip by assuming a precomputed steady-state gain.
@@ -30,6 +32,35 @@ This implementation focuses on:
 ✔ Out-of-context Vivado synthesis script (`tcl/kalman_synth.tcl`) targeting the same XC7Z020 part as the sibling repo
 
 **Not yet built** (see [Roadmap](#roadmap)): on-hardware PYNQ-Z2 integration, and the SystemVerilog / SpinalHDL / Amaranth ports.
+
+---
+
+## The Math: What This Circuit Actually Computes
+
+A Kalman filter tracks a 2-vector state `x = [price, drift]ᵀ` and its uncertainty (a 2x2 covariance matrix `P`) through a **predict → measure → update** cycle, run once per incoming price observation:
+
+```
+State-transition model:      Measurement model:
+x_k = F x_(k-1) + w          z_k = H x_(k-1) + v
+F = [[1, dt], [0, 1]]        H = [1, 0]
+w ~ N(0, Q)                  v ~ N(0, R)
+```
+
+`F` says "next price = current price + dt·drift, next drift = current drift" (a constant-velocity model). `H = [1, 0]` says "we only ever observe price directly, never drift" — the order book reports a midprice, not a rate of change.
+
+Each cycle runs five equations:
+
+```
+predict:   x_pred = F x                    P_pred = F P Fᵀ + Q
+innovate:  y = z - H x_pred                S = H P_pred Hᵀ + R
+gain:      K = P_pred Hᵀ S⁻¹
+update:    x = x_pred + K y                P = (I - K H) P_pred
+```
+
+Two things make this tractable in fixed-point RTL without a full linear-algebra library:
+
+- **`H` is a trivial selector.** Since `H = [1, 0]`, `H x_pred` is just `x_pred`'s first element and `H P_pred Hᵀ` is just `P_pred`'s `(0,0)` entry — no real matrix-vector product needed on the measurement side. This collapses the general matrix-inverse `S⁻¹` (normally the expensive part of a Kalman filter) down to a **single scalar reciprocal**.
+- **`F` is sparse, but `F P Fᵀ` isn't.** The `x`-side predict (`F x`) is cheap (one multiply-add), but running `P` — a real, dense-after-multiplication 2x2 matrix — through `F P Fᵀ` is exactly the kind of matrix arithmetic worth building real pipelined hardware for, and is the one piece of this filter that unambiguously needs it.
 
 ---
 
@@ -65,13 +96,27 @@ KalmanMeasurement (z, seqNum)                    KalmanConfig (dt, q0, q1, r)
                     [future: order book integration]
 ```
 
+For the actual wiring — which submodule computes what, how the state-feedback loop closes, and how many cycles each stage takes — see the detailed block diagram:
+
+<p align="center">
+  <img src="docs/previews/architecture_block_diagram.png" alt="Detailed architecture block diagram" width="100%" />
+</p>
+
+The filter tracks a 2-state model, `x = [price, drift]ᵀ`, with state transition `F = [[1, dt], [0, 1]]` and measurement matrix `H = [1, 0]`. Because `H` is a trivial selector, the measurement-side math (`H·x`, `H·P·Hᵀ`) never needs real matrix multiply hardware — but `F·P·Fᵀ` in the covariance-predict step does, and that's implemented as a genuinely reusable `Matrix2x2FixedMul` block, tested independently against dense arbitrary matrices (not just the sparse `F` it happens to be fed at the KalmanFilter call site).
+
+`dt` is deliberately a **runtime config input**, not a Scala constant folded into `F` at elaboration time — otherwise Vivado could algebraically simplify the "matrix multiply" down to something trivial, defeating the point of demonstrating real pipelined multiply hardware.
+
+### Fixed-point representation
+
 <p align="center">
   <img src="docs/previews/fixed_point_format.png" alt="Q16.16 fixed-point format" width="90%" />
 </p>
 
-The filter tracks a 2-state model, `x = [price, drift]ᵀ`, with state transition `F = [[1, dt], [0, 1]]` and measurement matrix `H = [1, 0]` (the order book reports price directly, not drift). Because `H` is a trivial selector, the measurement-side math (`H·x`, `H·P·Hᵀ`) never needs real matrix multiply hardware — but `F·P·Fᵀ` in the covariance-predict step does, and that's implemented as a genuinely reusable `Matrix2x2FixedMul` block, tested independently against dense arbitrary matrices (not just the sparse `F` it happens to be fed at the KalmanFilter call site).
+Every signal in the filter — state, covariance, gains, the reciprocal — is Q16.16: a 32-bit signed integer where the top 16 bits are the integer part (including sign) and the bottom 16 bits are the fraction, giving a resolution of `2⁻¹⁶ ≈ 1.5×10⁻⁵` over a range of roughly `±32,768`. Every multiply (`FixedPointMul`) produces a full 64-bit intermediate product, rounds half-up at the bit-15 boundary, and saturates to the 32-bit range rather than wrapping — the same discipline `satAdd` applies to every addition. This rounding/saturation behavior is replicated bit-for-bit in the Python golden model (`golden/kalman_ref.py`'s `fixed_mul`/`sat_add`), which is what makes the bit-exact hardware/golden diff possible.
 
-`dt` is deliberately a **runtime config input**, not a Scala constant folded into `F` at elaboration time — otherwise Vivado could algebraically simplify the "matrix multiply" down to something trivial, defeating the point of demonstrating real pipelined multiply hardware.
+### Why a division-free reciprocal?
+
+Hardware division is expensive — there's no single-cycle divider primitive on a 7-series FPGA the way there's a DSP48 multiplier. Because `H` collapses the Kalman gain's matrix inverse down to a scalar reciprocal `1/S`, this filter only ever needs **one** division per cycle, and `Reciprocal.scala` computes it with three steps instead of a divider: locate the input's highest set bit and shift it to bit 15 (normalizing into `[0.5, 1.0)`), seed an initial guess with the standard minimax linear approximation `y₀ = 48/17 − 32/17·m`, then run 3 rounds of Newton-Raphson (`y_{n+1} = y_n·(2 − m·y_n)`), each of which roughly doubles the number of correct bits. Denormalize by rescaling with the same shift computed in step one. No divider, no lookup ROM beyond two constants.
 
 ---
 
@@ -96,6 +141,12 @@ That means downstream stages never need `ShiftRegister` realignment against upst
 ~108 ns per update is far faster than realistic order-book update rates, so the lack of II=1 throughput is a non-issue in practice.
 
 <p align="center">
+  <img src="docs/previews/pipeline_latency.png" alt="Pipeline stage latency breakdown" width="90%" />
+</p>
+
+The reciprocal alone accounts for roughly two-thirds of the total latency — a direct, visible consequence of choosing three Newton-Raphson iterations. Fewer iterations would shorten the critical path at the cost of precision (each iteration currently doubles the number of correct bits, well past what Q16.16 needs); this is the one knob in the design with a clear latency/precision tradeoff.
+
+<p align="center">
   <img src="docs/previews/utilization.png" alt="FPGA Resource Utilization" width="90%" />
 </p>
 
@@ -110,6 +161,21 @@ Vivado isn't installed in the environment this was built in, so `tcl/kalman_synt
 </p>
 
 Both panels use **real, verified vectors** from `make sim` — not synthetic placeholder data. The top panel overlays a noisy synthetic price series against the floating-point golden filter and the actual Chisel RTL simulation output; the bottom panel shows the RTL is bit-exact against the fixed-point golden model (flat line at zero) and has only a small quantization delta against the floating-point reference.
+
+---
+
+## Demo: Cold-Start Step Response
+
+<p align="center">
+  <img src="docs/previews/convergence_demo.png" alt="Cold-start step response demo" width="90%" />
+</p>
+
+A simple, illustrative scenario: start the filter cold (`x = [0, 0]`, `P = I`) and feed it the same constant measurement (`z = 100`) over and over — what a book would look like if the price stopped moving entirely. Two things are worth noticing:
+
+- **The price estimate overshoots to a peak of ~117** around iteration 5, is still elevated at ~108 by iteration 15 (the exact number the convergence test below checks), and settles near the true value by iteration ~30-40. This isn't noise or a bug — `P`'s initial off-diagonal entry (zero at `t=0`, but immediately populated by `F`'s `dt` coupling term during the very first predict step) makes the filter briefly attribute part of the 0→100 jump to *drift* rather than *price*, since a filter that's just started has no way yet to distinguish "the price jumped" from "the price has been rising."
+- **The drift estimate spikes to ~33 and decays back to ~0** over the following iterations, as repeated measurements at the same level convince the filter there's no real trend — exactly the behavior you'd want from a working momentum estimator.
+
+This plot is generated directly from the same bit-exact fixed-point golden model that the 200/200-row hardware replay diff already proved identical to the RTL — so it's a faithful picture of what the actual hardware does, not an idealized floating-point stand-in.
 
 ---
 
@@ -137,7 +203,7 @@ One genuinely useful bug this caught: a directed convergence test initially look
 | `golden/kalman_ref.py` | `KalmanFilterRef` (floating-point) + `KalmanFilterFixedRef` (bit-exact Q16.16 emulation) |
 | `golden/diff_kalman.py` | Bit-exact hardware-vs-golden CSV diff |
 | `tcl/kalman_synth.tcl` | Out-of-context Vivado synth + place + route, targeting XC7Z020 @ 250 MHz |
-| `docs/gen_visuals.py` | Generates the three README figures from real verified vectors |
+| `docs/gen_visuals.py` | Generates all six README figures (format diagram, architecture, latency, signal overlay, demo, utilization) from real verified vectors |
 
 ---
 
@@ -184,7 +250,9 @@ kalman-filter/
   constraints/kalman_clock.xdc
   docs/
     gen_visuals.py
-    previews/                    fixed_point_format.png, signal_overlay.png, utilization.png
+    previews/                    fixed_point_format.png, architecture_block_diagram.png,
+                                  pipeline_latency.png, signal_overlay.png,
+                                  convergence_demo.png, utilization.png
   Makefile
 ```
 
