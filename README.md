@@ -173,6 +173,18 @@ Vivado 2024.1, xc7z020clg400-1 (PYNQ-Z2 part), out-of-context, **post-route** (`
 
 ---
 
+## What IS NOT implemented
+
+- **The 250 MHz (4.000 ns) target is not met.** Post-route setup WNS is −13.516 ns at 4.000 ns (8027 of 9261 endpoints failing) and −14.729 ns at 3.000 ns (8241 failing); `timing_summary.rpt` states "Timing constraints are not met" for both runs. The setup-limited clock is 57.1 MHz / 56.4 MHz.
+- **The design is not pipelined enough for that target.** Two combinational saturating adders feed a single-cycle 32×32 multiply (`x0_reg` → `k1YMul/prodReg_reg/PCIN`, 16.0 ns, 25 logic levels). Reaching 250 MHz needs registers between the adder chain and the multiplier inputs and a multi-stage multiplier; neither is in this RTL.
+- **Hold is not closed in the out-of-context flow.** 17 endpoints (4.000 ns) / 4 endpoints (3.000 ns) fail by −0.002 ns, all on config-input-port → register paths under OOC ideal-clock assumptions. Not demonstrated closed with a real clock network.
+- **Not run on hardware.** No PYNQ-Z2 integration, no block design, no bitstream, no board run. Every number is from ChiselTest/Verilator simulation or Vivado static timing.
+- **Throughput is one measurement per pass** (loop-carried, `busy` back-pressure); there is no II = 1 mode.
+- **No power numbers.** Area and timing are measured; power is not reported.
+- **Only the Chisel implementation exists.** The SystemVerilog / SpinalHDL / Amaranth ports in the roadmap are not started.
+
+---
+
 ## Signal Output vs. Golden Model
 
 <p align="center">
