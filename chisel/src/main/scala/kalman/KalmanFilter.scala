@@ -3,6 +3,22 @@ package kalman
 import chisel3._
 import chisel3.util._
 
+object KalmanFilter {
+  // Cycles from the accept edge to io.out.valid, for the default configuration.
+  //   1  accept -> stage1Valid
+  //   2 x Matrix2x2FixedMul (F*P, then (F*P)*F^T)
+  //   satAdd + 1   P_pred registers (saturating add of Q)
+  //   satAdd + 1   S register (saturating add of R)
+  //   Reciprocal
+  //   FixedPointMul  gain K = P_pred * invS
+  //   FixedPointMul  K * y  (the update-x / update-P multipliers run in parallel)
+  //   satAdd       registered sums of the state update, clamped on the commit edge
+  //   1  registered output valid
+  def latency(nrIterations: Int = 3): Int =
+    1 + 2 * Matrix2x2FixedMul.LATENCY + (satAdd.LATENCY + 1) + (satAdd.LATENCY + 1) +
+      Reciprocal.latency(nrIterations) + 2 * FixedPointMul.LATENCY + satAdd.LATENCY + 1
+}
+
 // Top-level 2-state (price, drift) Kalman filter: predict -> innovate -> reciprocal ->
 // gain -> update, structurally pipelined (no FSM) the same way Reciprocal itself is
 // pipelined internally.
@@ -13,17 +29,25 @@ import chisel3.util._
 // until the pipeline finishes, since io.in.ready is gated on !busy). Every submodule in
 // this design is a plain combinational-plus-register pipeline with no internal state
 // beyond its own latency, so when fed constant inputs it settles into a steady-state
-// output that remains correct indefinitely after its first `yValid` pulse. That means
-// no ShiftRegister realignment is needed anywhere here -- each downstream stage simply
-// reads the upstream stage's *data* wire directly, gated on the upstream stage's single
-// `valid` pulse (whichever arrives last among its dependencies).
+// output that remains correct indefinitely after its first `yValid` pulse. Each
+// downstream stage therefore reads the upstream stage's *data* directly and is timed
+// by the upstream `valid` pulse (whichever arrives last among its dependencies); the
+// only rule is that a valid pulse must never overtake the data it announces, so every
+// register added to a data path here is matched by a register on the valid path that
+// gates its consumer.
+//
+// Timing structure: no register-to-register path contains more than one carry chain.
+// satAdd/satSub register their exact 33-bit sum and clamp it into the consuming
+// register, every multiplier input and output is a register (FixedPointMul registers
+// its operands), and the intermediate results xPred0, yInnov, P_pred and S are
+// registers, not wires.
 //
 // Because the filter is loop-carried (predict_{k+1} depends on the fully-updated
 // x_k/P_k), it cannot accept a new measurement mid-pipeline -- unlike the sibling repo's
 // order book (stateless per-message, always-ready). This uses a Decoupled input with a
-// `busy` flag instead: `ready` deasserts for one full predict->update pass (~27 cycles
-// @ this config), which is a non-issue since HFT quote arrival intervals are orders of
-// magnitude slower than a ~27-cycle/~108ns pass at 250 MHz.
+// `busy` flag instead: `ready` deasserts for one full predict->update pass
+// (KalmanFilter.latency() cycles), which is a non-issue since HFT quote arrival
+// intervals are orders of magnitude slower than one pass.
 class KalmanFilter(
   val p0_00: Double = 1.0,
   val p0_01: Double = 0.0,
@@ -34,6 +58,10 @@ class KalmanFilter(
 ) extends Module {
   val W = FixedPoint.WIDTH
   val ONE = FixedPoint.toFixed(1.0)
+
+  // A pipeline register with an explicit Q16.16 width (RegNext would leave the width to
+  // inference, which the saturating-add clamp cannot query at elaboration time).
+  def reg32(next: SInt): SInt = { val r = Reg(SInt(W.W)); r := next; r }
 
   val io = IO(new Bundle {
     val cfg  = Input(new KalmanConfig)
@@ -74,7 +102,7 @@ class KalmanFilter(
   mulDtX1.io.a := dtReg
   mulDtX1.io.b := x1
   mulDtX1.io.valid := stage1Valid
-  val xPred0 = satAdd(x0, mulDtX1.io.y) // correct/stable from mulDtX1.io.yValid onward
+  val xPred0 = reg32(satAdd(x0, mulDtX1.io.y)) // stable from mulDtX1.io.yValid + 1 onward
 
   // ---- Predict P: P_pred = F*P*F^T + Q (genuine pipelined 2x2 matrix multiply, chained) ----
   def const(d: Double): SInt = FixedPoint.toFixed(d).S(W.W)
@@ -101,18 +129,20 @@ class KalmanFilter(
   mm2.io.b := fTMat
   mm2.io.valid := mm1.io.yValid
 
-  val pPred00 = satAdd(mm2.io.y.m00, q0Reg)
-  val pPred01 = mm2.io.y.m01
-  val pPred11 = satAdd(mm2.io.y.m11, q1Reg)
+  val pPred00    = reg32(satAdd(mm2.io.y.m00, q0Reg))
+  val pPred01    = reg32(ShiftRegister(mm2.io.y.m01, satAdd.LATENCY))
+  val pPred11    = reg32(satAdd(mm2.io.y.m11, q1Reg))
+  val pPredValid = ShiftRegister(mm2.io.yValid, satAdd.LATENCY + 1, false.B, true.B)
 
   // ---- Innovation: y = z - H*x_pred (H=[1,0] selects x_pred0); S = H*P_pred*H^T + R (selects P_pred00) ----
-  val yInnov = satAdd(zReg, -xPred0)
-  val sVar   = satAdd(pPred00, rReg)
+  val yInnov    = reg32(satSub(zReg, xPred0))
+  val sVar      = reg32(satAdd(pPred00, rReg))
+  val sVarValid = ShiftRegister(pPredValid, satAdd.LATENCY + 1, false.B, true.B)
 
   // ---- Reciprocal: invS = 1/S, triggered once predict-P (the long pole) settles ----
   val reciprocal = Module(new Reciprocal(nrIterations))
   reciprocal.io.x     := sVar
-  reciprocal.io.valid := mm2.io.yValid
+  reciprocal.io.valid := sVarValid
 
   // ---- Gain: K = P_pred_col0 * invS (H trivial selector => no real inverse needed) ----
   val k0Mul = Module(new FixedPointMul)
@@ -156,12 +186,13 @@ class KalmanFilter(
   val k1P01Mul = Module(new FixedPointMul)
   k1P01Mul.io.a := k1; k1P01Mul.io.b := pPred01; k1P01Mul.io.valid := gainValid
 
-  val pNew00 = satAdd(pPred00, -k0P00Mul.io.y)
-  val pNew01 = satAdd(pPred01, -k0P01Mul.io.y)
-  val pNew11 = satAdd(pPred11, -k1P01Mul.io.y)
+  val pNew00 = satSub(pPred00, k0P00Mul.io.y)
+  val pNew01 = satSub(pPred01, k0P01Mul.io.y)
+  val pNew11 = satSub(pPred11, k1P01Mul.io.y)
 
-  // ---- Commit + output (all of update-x/update-P's multipliers share the same trigger and latency) ----
-  val doneValid = k0YMul.io.yValid
+  // ---- Commit (all of update-x/update-P's multipliers share the same trigger and latency;
+  //      the saturating adds register their sums one cycle after the multipliers' outputs) ----
+  val doneValid = ShiftRegister(k0YMul.io.yValid, satAdd.LATENCY, false.B, true.B)
 
   when(doneValid) {
     x0  := xNew0
@@ -172,10 +203,11 @@ class KalmanFilter(
     busyReg := false.B
   }
 
-  io.out.price  := xNew0
-  io.out.drift  := xNew1
+  // ---- Output: the committed state, one cycle after the commit edge (registers only, no logic on the ports) ----
+  io.out.price  := x0
+  io.out.drift  := x1
   io.out.seqNum := seqReg
-  io.out.valid  := doneValid
+  io.out.valid  := RegNext(doneValid, false.B)
 }
 
 object KalmanFilterVerilog extends App {

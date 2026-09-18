@@ -11,11 +11,18 @@ class Matrix2x2 extends Bundle {
   val m11 = SInt(FixedPoint.WIDTH.W)
 }
 
+object Matrix2x2FixedMul {
+  // 8 parallel FixedPointMul terms + a saturating add (registered sum, then clamp into the output register).
+  val LATENCY = FixedPointMul.LATENCY + satAdd.LATENCY + 1
+}
+
 // Generic pipelined 2x2 x 2x2 fixed-point matrix multiply: y = a * b.
-// 8 parallel FixedPointMul dot-product terms (2 cycles) + 1 registered saturating-add
-// stage per output element (1 cycle) = 3-cycle latency, fully pipelined (new inputs
-// accepted every cycle). Used for the covariance-predict step F*P*F^T in KalmanFilter;
-// tested here against dense, arbitrary matrices to prove it is genuinely general-purpose.
+// 8 parallel FixedPointMul dot-product terms (FixedPointMul.LATENCY cycles) + a
+// saturating add per output element (registered sum + clamp into the output register:
+// 2 cycles), fully pipelined (new
+// inputs accepted every cycle). Used for the covariance-predict step F*P*F^T in
+// KalmanFilter; tested here against dense, arbitrary matrices to prove it is
+// genuinely general-purpose.
 class Matrix2x2FixedMul extends Module {
   val io = IO(new Bundle {
     val a      = Input(new Matrix2x2)
@@ -42,11 +49,12 @@ class Matrix2x2FixedMul extends Module {
   val (p11a, _)     = term(io.a.m10, io.b.m01)
   val (p11b, _)     = term(io.a.m11, io.b.m11)
 
-  val sumValidReg = RegNext(v00a, false.B)
-  val y00Reg = RegNext(satAdd(p00a, p00b))
-  val y01Reg = RegNext(satAdd(p01a, p01b))
-  val y10Reg = RegNext(satAdd(p10a, p10b))
-  val y11Reg = RegNext(satAdd(p11a, p11b))
+  def reg32(next: SInt): SInt = { val r = Reg(SInt(FixedPoint.WIDTH.W)); r := next; r }
+  val sumValidReg = ShiftRegister(v00a, satAdd.LATENCY + 1, false.B, true.B)
+  val y00Reg = reg32(satAdd(p00a, p00b))
+  val y01Reg = reg32(satAdd(p01a, p01b))
+  val y10Reg = reg32(satAdd(p10a, p10b))
+  val y11Reg = reg32(satAdd(p11a, p11b))
 
   io.y.m00  := y00Reg
   io.y.m01  := y01Reg

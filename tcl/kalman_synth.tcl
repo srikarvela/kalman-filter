@@ -38,7 +38,8 @@ create_project -in_memory -part $part
 read_verilog [file join $root chisel generated KalmanFilter.v]
 read_xdc -mode out_of_context [file join $root constraints kalman_clock.xdc]
 
-synth_design -top KalmanFilter -part $part -mode out_of_context
+# -keep_equivalent_registers: the reciprocal replicates its shift-amount registers on purpose (fan-out)
+synth_design -top KalmanFilter -part $part -mode out_of_context -keep_equivalent_registers
 if {$period_override ne ""} {
     create_clock -name clock -period $period_override [get_ports clock]
 }

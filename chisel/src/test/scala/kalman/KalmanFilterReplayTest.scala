@@ -52,7 +52,7 @@ class KalmanFilterReplayTest extends AnyFlatSpec with ChiselScalatestTester with
         dut.io.in.valid.poke(true.B)
 
         var waited = 0
-        while (!dut.io.in.ready.peek().litToBoolean && waited < 100) {
+        while (!dut.io.in.ready.peek().litToBoolean && waited < KalmanFilter.latency() + 8) {
           dut.clock.step(1)
           waited += 1
         }
@@ -61,11 +61,11 @@ class KalmanFilterReplayTest extends AnyFlatSpec with ChiselScalatestTester with
         dut.io.in.valid.poke(false.B)
 
         var c = 0
-        while (!dut.io.out.valid.peek().litToBoolean && c < 100) {
+        while (!dut.io.out.valid.peek().litToBoolean && c < KalmanFilter.latency() + 8) {
           dut.clock.step(1)
           c += 1
         }
-        dut.io.out.valid.expect(true.B, s"no output for seq=$seq within 100 cycles")
+        dut.io.out.valid.expect(true.B, s"no output for seq=$seq within ${KalmanFilter.latency() + 8} cycles")
         dut.io.out.seqNum.expect(seq.U)
 
         val priceRaw = dut.io.out.price.peek().litValue

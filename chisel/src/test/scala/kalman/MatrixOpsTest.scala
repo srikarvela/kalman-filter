@@ -43,7 +43,7 @@ class MatrixOpsTest extends AnyFlatSpec with ChiselScalatestTester with Matchers
     dut.io.valid.poke(true.B)
     dut.clock.step(1)
     dut.io.valid.poke(false.B)
-    dut.clock.step(2) // 3-cycle total latency
+    dut.clock.step(Matrix2x2FixedMul.LATENCY - 1)
     dut.io.yValid.expect(true.B)
     (dut.io.y.m00.peek().litValue, dut.io.y.m01.peek().litValue,
      dut.io.y.m10.peek().litValue, dut.io.y.m11.peek().litValue)
@@ -104,13 +104,13 @@ class MatrixOpsTest extends AnyFlatSpec with ChiselScalatestTester with Matchers
       pokeMatrix(dut.io.a, a1); pokeMatrix(dut.io.b, b1); dut.io.valid.poke(true.B)
       dut.clock.step(1)
       dut.io.valid.poke(false.B)
-      dut.clock.step(1) // 3 cycles since a0/b0 issued
+      dut.clock.step(Matrix2x2FixedMul.LATENCY - 2) // LATENCY cycles since a0/b0 issued
 
       dut.io.yValid.expect(true.B)
       (dut.io.y.m00.peek().litValue, dut.io.y.m01.peek().litValue,
        dut.io.y.m10.peek().litValue, dut.io.y.m11.peek().litValue) shouldBe Matrix2x2Ref(a0, b0)
 
-      dut.clock.step(1) // 3 cycles since a1/b1 issued
+      dut.clock.step(1) // LATENCY cycles since a1/b1 issued
       dut.io.yValid.expect(true.B)
       (dut.io.y.m00.peek().litValue, dut.io.y.m01.peek().litValue,
        dut.io.y.m10.peek().litValue, dut.io.y.m11.peek().litValue) shouldBe Matrix2x2Ref(a1, b1)

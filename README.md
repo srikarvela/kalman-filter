@@ -26,10 +26,10 @@ This implementation focuses on:
 ✔ Pipelined 2x2 fixed-point matrix multiply, tested against dense arbitrary matrices
 ✔ Pipelined Newton-Raphson reciprocal (no hardware divider), swept 0.01–1000
 ✔ Top-level structural (FSM-free) predict → innovate → reciprocal → gain → update pipeline
-✔ ChiselTest suite: 24 cases across all submodules + the full filter
+✔ ChiselTest suite: 25 cases across all submodules + the full filter (including an exact-latency check against the `KalmanFilter.latency()` bookkeeping constant)
 ✔ Python golden model: floating-point reference + bit-exact Q16.16 emulation of the RTL algorithm
 ✔ End-to-end replay: 200/200 rows bit-exact match between RTL simulation and the golden model
-✔ Out-of-context Vivado 2024.1 synthesis + place & route (`tcl/kalman_synth.tcl`) on the same XC7Z020 part as the sibling repo, with the post-route reports committed under [reports/](reports) — **the design does not close at the 250 MHz target: setup-limited Fmax is 57 MHz** (see [Synthesis results](#synthesis-results--post-route-timing-and-utilization))
+✔ Out-of-context Vivado 2024.1 synthesis + place & route (`tcl/kalman_synth.tcl`) on the same XC7Z020 part as the sibling repo, with the post-route reports committed under [reports/](reports). As first written the design ran at 57 MHz; after re-pipelining the multiplier, the saturating adders and the reciprocal's shifters it reaches a setup-limited **240.6 MHz at the 4.000 ns constraint, 0.156 ns short of closing 250 MHz** (see [Synthesis results](#synthesis-results--post-route-timing-and-utilization))
 
 **Not yet built** (see [Roadmap](#roadmap)): on-hardware PYNQ-Z2 integration, and the SystemVerilog / SpinalHDL / Amaranth ports.
 
@@ -124,7 +124,7 @@ Hardware division is expensive — there's no single-cycle divider primitive on 
 
 `KalmanFilter.scala` has no state machine. Every submodule (`FixedPointMul`, `Matrix2x2FixedMul`, `Reciprocal`) is a plain combinational-plus-register pipeline with no internal control state. The filter's persistent state (`x0, x1, P00, P01, P11`) and per-request latched inputs are held constant for an entire request — nothing else can write them until the pipeline finishes — so each submodule, fed constant inputs, settles into a steady-state output that remains correct indefinitely after its first `valid` pulse.
 
-That means downstream stages never need `ShiftRegister` realignment against upstream latency: they just read the upstream *data* wire directly, gated on whichever dependency's `valid` pulse arrives last. A single `busy` register handles backpressure (`Decoupled` input), since the recursive state dependency (predict₍ₖ₊₁₎ needs the fully-updated x_k/P_k) means a new measurement genuinely can't be accepted mid-pipeline — unlike the order book, which is stateless per message and always-ready.
+That means downstream stages never need `ShiftRegister` realignment against upstream latency: they just read the upstream *data* directly, gated on whichever dependency's `valid` pulse arrives last. The one rule this imposes is that a `valid` pulse must never overtake the data it announces, so every pipeline register added on a data path (the registered `xPred0`, `yInnov`, `P_pred` and `S` intermediates, the multiplier's operand registers) is matched by a register on the `valid` path that gates its consumer; `KalmanFilter.latency()` adds up exactly those stages, and a test checks the RTL against it. A single `busy` register handles backpressure (`Decoupled` input), since the recursive state dependency (predict₍ₖ₊₁₎ needs the fully-updated x_k/P_k) means a new measurement genuinely can't be accepted mid-pipeline — unlike the order book, which is stateless per message and always-ready.
 
 ---
 
@@ -132,32 +132,32 @@ That means downstream stages never need `ShiftRegister` realignment against upst
 
 | Metric | Value |
 |---|---|
-| Clock constraint | 250 MHz (4.000 ns period), matching the sibling repo — **not met**, see below |
-| Achieved clock (post-route, setup-limited) | **57.1 MHz** at the 4.000 ns constraint (WNS −13.516 ns); 56.4 MHz at 3.000 ns |
-| Pipeline latency | ~27 cycles per accepted measurement (≈ 473 ns at 57.1 MHz; it would be ~108 ns if 250 MHz were met) |
-| Long pole (cycles) | the Newton-Raphson reciprocal (~17 of the 27 cycles) |
-| Long pole (timing) | a register-to-register path through two saturating adders into a single-cycle 32×32 multiply (16.0 ns, 25 logic levels) |
-| Throughput | 1 measurement per ~27 cycles (loop-carried, not II=1) |
+| Clock constraint | 250 MHz (4.000 ns period), matching the sibling repo — **not met**: WNS -0.156 ns, 9 of 14954 endpoints failing |
+| Achieved clock (post-route, setup-limited) | **240.6 MHz** at the 4.000 ns constraint; 245.4 MHz at 3.000 ns. Before re-pipelining: 57.1 MHz |
+| Pipeline latency | 110 cycles per accepted measurement (≈ 457 ns at 240.6 MHz), up from 27 cycles at 57 MHz (≈ 473 ns): the pipelined design finishes an update sooner in wall-clock time |
+| Long pole (cycles) | the Newton-Raphson reciprocal (67 of the 110 cycles) |
+| Long pole (timing) | 4.103 ns, 4 logic levels, 3.151 ns of it routing: `reciprocal/shiftAmtCopiesN0_3_reg[0]` → `reciprocal/normPairN1_left_reg[29]` |
+| Throughput | 1 measurement per 110 cycles (loop-carried, not II=1) |
 | Target device | Zynq XC7Z020 (PYNQ-Z2), out-of-context synthesis + place & route |
 
-Even at the measured 57 MHz, ~0.5 µs per update is far faster than realistic order-book update rates, so the lack of II=1 throughput is a non-issue in practice; the missed 250 MHz target is a real result and is discussed below.
+≈ 457 ns per update is far faster than realistic order-book update rates, so the lack of II=1 throughput is a non-issue in practice; how close the design gets to 250 MHz, and what still stands in the way, is measured below.
 
 <p align="center">
   <img src="docs/previews/pipeline_latency.png" alt="Pipeline stage latency breakdown" width="90%" />
 </p>
 
-The reciprocal alone accounts for roughly two-thirds of the total cycle count — a direct, visible consequence of choosing three Newton-Raphson iterations. Fewer iterations would shorten the pipeline at the cost of precision (each iteration currently doubles the number of correct bits, well past what Q16.16 needs); this is the one knob in the design with a clear latency/precision tradeoff. The nanosecond figures in the chart use the measured post-route clock from `reports/N_4.000ns/timing_summary.rpt`, not the 250 MHz target.
+The reciprocal alone accounts for roughly three-fifths of the total cycle count (67 of 110) — a direct, visible consequence of choosing three Newton-Raphson iterations. Fewer iterations would shorten the pipeline at the cost of precision (each iteration currently doubles the number of correct bits, well past what Q16.16 needs); this is the one knob in the design with a clear latency/precision tradeoff. The nanosecond figures in the chart use the measured post-route clock from `reports/N_4.000ns/timing_summary.rpt`, not the 250 MHz target.
 
 ---
 
 ## Synthesis results — post-route timing and utilization
 
-Vivado 2024.1, xc7z020clg400-1 (PYNQ-Z2 part), out-of-context, **post-route** (`synth_design -mode out_of_context`, `opt_design`, `place_design`, `phys_opt_design`, `route_design`). Fmax = 1 / (period − WNS), i.e. the setup-limited clock derived from post-route slack, the same way the sibling cordic-engine repo reports it. `make vm-sweep` (or `make kf-sweep` with a native Vivado) regenerates the reports and `scripts/ppa_table.py` builds this table and [reports/ppa.csv](reports/ppa.csv) directly from the committed `utilization.rpt` / `timing_summary.rpt` files in [reports/](reports) — no number here comes from anywhere else. Each row is one place-and-route run of the same RTL (`chisel/generated/KalmanFilter.v`, regenerated from the Chisel sources before the run) at the clock constraint in its `period (ns)` column.
+Vivado 2024.1, xc7z020clg400-1 (PYNQ-Z2 part), out-of-context, **post-route** (`synth_design -mode out_of_context -keep_equivalent_registers`, `opt_design`, `place_design`, `phys_opt_design`, `route_design`). Fmax = 1 / (period − WNS), i.e. the setup-limited clock derived from post-route slack, the same way the sibling cordic-engine repo reports it. `make vm-sweep` (or `make kf-sweep` with a native Vivado) regenerates the reports and `scripts/ppa_table.py` builds this table and [reports/ppa.csv](reports/ppa.csv) directly from the committed `utilization.rpt` / `timing_summary.rpt` files in [reports/](reports) — no number here comes from anywhere else. Each row is one place-and-route run of the committed RTL (`chisel/generated/KalmanFilter.v`, regenerated from the Chisel sources before the run) at the clock constraint in its `period (ns)` column.
 
 | run | Slice LUTs (logic + mem) | FF | CARRY4 | DSP | BRAM | period (ns) | WNS (ns) / failing | WHS (ns) / failing | constraints met | Fmax (MHz) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
-| N_4.000ns | 4338 (4310 + 28) | 2279 | 1181 | 116 | 0 | 4.000 | −13.516 / 8027 | −0.002 / 17 | no | 57.1 |
-| N_3.000ns | 4344 (4316 + 28) | 2306 | 1181 | 116 | 0 | 3.000 | −14.729 / 8241 | −0.002 / 4 | no | 56.4 |
+| N_4.000ns | 5190 (5082 + 108) | 9108 | 968 | 116 | 0 | 4.000 | -0.156 / 9 | +0.059 / 0 | no | 240.6 |
+| N_3.000ns | 5225 (5117 + 108) | 8983 | 968 | 116 | 0 | 3.000 | -1.075 / 2309 | -0.002 / 4 | no | 245.4 |
 
 <p align="center">
   <img src="docs/previews/utilization.png" alt="FPGA Resource Utilization (post-route, 4.000 ns constraint)" width="90%" />
@@ -165,21 +165,34 @@ Vivado 2024.1, xc7z020clg400-1 (PYNQ-Z2 part), out-of-context, **post-route** (`
 
 **Reading the table.**
 
-- **Setup is not met at either constraint, by a wide margin.** At 4.000 ns the worst setup slack is −13.516 ns with 8027 of 9261 endpoints failing (TNS −38 833 ns); at 3.000 ns it is −14.729 ns. Both runs give the same answer for the setup-limited clock: **≈ 57 MHz**, not 250 MHz. The 3.000 ns run was made only to check that the Fmax derivation is stable under a tighter constraint (it is: 56.4 vs 57.1 MHz).
-- **Why.** The worst path in both reports is register-to-register, `x0_reg` → `k1YMul/prodReg_reg/PCIN` (4.000 ns) and `x0_reg` → `k0YMul/prodReg_reg/PCIN` (3.000 ns): 16.0 ns of data-path delay over 25–26 logic levels (19–20 CARRY4 + a DSP48E1). It is the structural-pipeline shortcut described above taken literally: `xPred0 = satAdd(x0, dt·x1)` and `yInnov = satAdd(z, −xPred0)` are combinational, and they feed `FixedPointMul`, whose first stage computes the full 64-bit product of two 32-bit operands in a single cycle (four cascaded DSP48E1s, 116 DSPs in total). Two saturating adders (33-bit carry chain + compare + clamp each) plus an unpipelined 32×32 multiply is ~16 ns on a −1 speed-grade Zynq-7020. Closing 250 MHz would need the multiplier split across 3–4 DSP pipeline stages (Vivado's own DSP48 `MREG`/`PREG` registers) and registers between the adder chain and the multiplier inputs, i.e. a few more cycles of latency; that re-pipelining has **not** been done and is not claimed here.
-- **Hold is not met either, marginally.** 17 endpoints (4.000 ns) / 4 endpoints (3.000 ns) fail at −0.002 ns worst slack. Every one of the 30 worst hold paths in `reports/N_*ns/hold_paths.rpt` (`report_timing -hold -max_paths 30`) runs from a config input port into its input register (`io_cfg_q0/q1/r` → `q0Reg/q1Reg/rReg`), which is the ideal-clock artifact of out-of-context analysis: a 0.500 ns input delay against a clock path with no global buffer or insertion delay. It would not survive a real clock network and board-derived input constraints, but that has not been demonstrated, so hold closure is **not claimed**.
-- **Overall: `report_timing_summary` states "Timing constraints are not met"** for both runs. The correct summary of this design's timing today is: 4338 LUTs / 2279 FFs / 116 DSPs / 0 BRAM, setup-limited Fmax ≈ 57 MHz, hold marginally failing on OOC input-port paths.
+- **Setup: 9 of 14954 endpoints fail at the 4.000 ns constraint, worst slack -0.156 ns (TNS -0.591 ns).** The setup-limited clock is 240.6 MHz; the 3.000 ns run, which over-constrains the same RTL to see where it lands, gives 245.4 MHz, consistent with it. **250 MHz is not closed.** The worst path is `reciprocal/shiftAmtCopiesN0_3_reg[0]/C` → `reciprocal/normPairN1_left_reg[29]/D`: 4.103 ns over 4 logic levels (LUT3=1 LUT6=3), of which 0.952 ns is logic and **3.151 ns is routing** — the shift-amount registers of the reciprocal's normalizing barrel shifter fanning out to the shifter's mux LUTs across the placed design. Every remaining violation is of this kind (routing-dominated, under 0.2 ns); no register-to-register path in the design holds more than one carry chain or one shifter any more.
+- **Hold:** 0 failing endpoints at 4.000 ns (WHS +0.059 ns); 4 at 3.000 ns (WHS -0.002 ns). In these out-of-context runs the hold result flips between +0.059 ns and −0.002 ns from run to run on config-input-port → register paths (`io_cfg_*` → `q0Reg/q1Reg/rReg`), the ideal-clock artifact of OOC analysis (a 0.500 ns input delay against a clock with no buffer or insertion delay). It says nothing about hold with a real clock network and is not claimed either way.
+- **Overall: `report_timing_summary` states "Timing constraints are not met"** for both runs. The correct summary of this design's timing today is: 5190 LUTs / 9108 FFs / 116 DSPs / 0 BRAM, setup-limited Fmax 240.6 MHz at a 250 MHz constraint, 9 endpoints short by ≤ 0.156 ns.
 - The routed checkpoints (`build/kalman_<period>ns_routed.dcp`) are kept locally (gitignored) so further paths can be queried without re-running the flow.
+
+### How the design got from 57 MHz to 240.6 MHz
+
+The first synthesis of this design (its reports are the "before" row below) put the worst path at 16.0 ns: `x0_reg` → two combinational saturating adders (`xPred0`, then `yInnov`) → the A input of a single-cycle 32×32 multiply built from four cascaded DSP48E1s. Each change below was verified before synthesis with the full ChiselTest suite (25 cases, including an exact-latency check against `KalmanFilter.latency()`) and the 200-row bit-exact replay against the Python golden model; the arithmetic never changed, only where the registers are. Every row is a real post-route run at the 4.000 ns constraint (the intermediate runs' reports are not committed; the numbers are quoted from them).
+
+| step | change | WNS (ns) | failing / total endpoints | Fmax (MHz) | LUT | FF | latency (cycles) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| before | as first written: single-cycle 32×32 product, combinational saturating adders | −13.516 | 8027 / 9261 | 57.1 | 4338 | 2279 | 27 |
+| 1 | `FixedPointMul` rebuilt as four DSP-sized partial products with operand, M and P registers (6 stages); `xPred0`, `yInnov`, `P_pred`, `S` made registers; reciprocal normalize/denormalize split into LZC + shift stages; `satSub` instead of `satAdd(a, −b)` | −2.090 | 3958 / 10877 | 164.2 | 6338 | 5212 | 77 |
+| 2 | saturating add/sub register the exact 33-bit sum before clamping; clamp rewritten as a top-bits AND/OR check instead of two magnitude comparators (which Vivado built as carry chains); multiplier combine split into two binary adds (7 stages) | −0.317 | 118 / 12646 | 231.6 | 5389 | 6948 | 97 |
+| 3 | multiplier saturate split into flag registers + mux (8 stages); both barrel shifters split into compute-both-directions + select | −0.393 | 71 / 13627 | 227.6 | 5043 | 7917 | 110 |
+| **4 (committed)** | shift-amount register replicated 4× per shifter (one copy per 8-bit slice), `-keep_equivalent_registers` | **-0.156** | **9 / 14954** | **240.6** | 5190 | 9108 | 110 |
+| 5 (not kept) | shift magnitude/sign decoded into 8 replicated registers | −0.235 | 13 / 14905 | 236.1 | 5207 | 9115 | 110 |
+
+Steps 3–5 are within placement noise of each other (the worst path changes identity between runs while the logic on it stays at about 1 ns); step 4 is the best measured result and is what is committed. The DSP count is 116 throughout (29 multipliers × 4 DSP48E1), LUTs are flat, and the register count roughly quadruples — which is what pipelining is.
 
 ---
 
 ## What IS NOT implemented
 
-- **The 250 MHz (4.000 ns) target is not met.** Post-route setup WNS is −13.516 ns at 4.000 ns (8027 of 9261 endpoints failing) and −14.729 ns at 3.000 ns (8241 failing); `timing_summary.rpt` states "Timing constraints are not met" for both runs. The setup-limited clock is 57.1 MHz / 56.4 MHz.
-- **The design is not pipelined enough for that target.** Two combinational saturating adders feed a single-cycle 32×32 multiply (`x0_reg` → `k1YMul/prodReg_reg/PCIN`, 16.0 ns, 25 logic levels). Reaching 250 MHz needs registers between the adder chain and the multiplier inputs and a multi-stage multiplier; neither is in this RTL.
-- **Hold is not closed in the out-of-context flow.** 17 endpoints (4.000 ns) / 4 endpoints (3.000 ns) fail by −0.002 ns, all on config-input-port → register paths under OOC ideal-clock assumptions. Not demonstrated closed with a real clock network.
-- **Not run on hardware.** No PYNQ-Z2 integration, no block design, no bitstream, no board run. Every number is from ChiselTest/Verilator simulation or Vivado static timing.
-- **Throughput is one measurement per pass** (loop-carried, `busy` back-pressure); there is no II = 1 mode.
+- **The 250 MHz (4.000 ns) target is still not met.** Post-route setup WNS is -0.156 ns at 4.000 ns (9 of 14954 endpoints failing) and -1.075 ns at 3.000 ns (2309 failing); `timing_summary.rpt` states "Timing constraints are not met" for both runs. The setup-limited clock is 240.6 MHz / 245.4 MHz. What remains is routing on the reciprocal's shift-amount fan-out, not logic depth; closing the last 0.156 ns would need placement constraints (or a log-shifter restructuring) that this out-of-context flow does not attempt.
+- **Hold is not closed in the out-of-context flow.** 0 / 4 endpoints fail at 4.000 / 3.000 ns by at most 0.002 ns, on config-input-port → register paths under OOC ideal-clock assumptions; the same paths pass by +0.059 ns in other runs. Not demonstrated closed with a real clock network.
+- **Not run on hardware.** No PYNQ-Z2 integration, no block design, no bitstream, no board run. Every number is from ChiselTest simulation or Vivado static timing.
+- **Latency went up to buy the clock.** 110 cycles per measurement (27 before re-pipelining); throughput is one measurement per pass (loop-carried, `busy` back-pressure), there is no II = 1 mode.
 - **No power numbers.** Area and timing are measured; power is not reported.
 - **Only the Chisel implementation exists.** The SystemVerilog / SpinalHDL / Amaranth ports in the roadmap are not started.
 
@@ -226,8 +239,8 @@ One genuinely useful bug this caught: a directed convergence test initially look
 
 | File | Purpose |
 |---|---|
-| `chisel/src/main/scala/kalman/FixedPoint.scala` | Q16.16 primitives: `FixedPointMul` (2-cycle pipelined multiplier, round-half-up, saturating), `satAdd` |
-| `chisel/src/main/scala/kalman/MatrixOps.scala` | `Matrix2x2` bundle + `Matrix2x2FixedMul` (3-cycle pipelined 2x2 matrix multiply) |
+| `chisel/src/main/scala/kalman/FixedPoint.scala` | Q16.16 primitives: `FixedPointMul` (8-stage pipelined multiplier: registered operands, four DSP-sized partial products with M/P registers, two combine stages, round-half-up, saturate flags, saturate mux), `satAdd` / `satSub` (registered exact sum, then a top-bits clamp) |
+| `chisel/src/main/scala/kalman/MatrixOps.scala` | `Matrix2x2` bundle + `Matrix2x2FixedMul` (10-cycle pipelined 2x2 matrix multiply: 8 multipliers + registered saturating adds) |
 | `chisel/src/main/scala/kalman/Reciprocal.scala` | Pipelined Newton-Raphson `1/x` (normalize → minimax seed → 3 NR iterations → denormalize) |
 | `chisel/src/main/scala/kalman/Types.scala` | `KalmanMeasurement`, `KalmanEstimate`, `KalmanConfig` I/O bundles |
 | `chisel/src/main/scala/kalman/KalmanFilter.scala` | Top-level structural predict/innovate/gain/update pipeline |

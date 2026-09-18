@@ -25,7 +25,7 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
     dut.io.valid.poke(true.B)
     dut.clock.step(1)
     dut.io.valid.poke(false.B)
-    dut.clock.step(1)
+    dut.clock.step(FixedPointMul.LATENCY - 1)
     dut.io.yValid.expect(true.B)
     dut.io.y.peek().litValue
   }
@@ -100,6 +100,23 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
     }
   }
 
+  it should "report FixedPointMul.LATENCY exactly (valid neither early nor late)" in {
+    test(new FixedPointMul) { dut =>
+      dut.io.a.poke(FixedPoint.toFixed(1.5).S); dut.io.b.poke(FixedPoint.toFixed(2.0).S)
+      dut.io.valid.poke(true.B)
+      dut.clock.step(1)
+      dut.io.valid.poke(false.B)
+      for (_ <- 1 until FixedPointMul.LATENCY) {
+        dut.io.yValid.expect(false.B)
+        dut.clock.step(1)
+      }
+      dut.io.yValid.expect(true.B)
+      dut.io.y.peek().litValue shouldBe FixedPoint.toFixed(3.0)
+      dut.clock.step(1)
+      dut.io.yValid.expect(false.B)
+    }
+  }
+
   it should "be fully pipelined (accept a new input every cycle)" in {
     test(new FixedPointMul) { dut =>
       val rawA0 = FixedPoint.toFixed(2.0); val rawB0 = FixedPoint.toFixed(3.0)
@@ -110,6 +127,7 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       dut.io.a.poke(rawA1.S); dut.io.b.poke(rawB1.S); dut.io.valid.poke(true.B)
       dut.clock.step(1)
       dut.io.valid.poke(false.B)
+      dut.clock.step(FixedPointMul.LATENCY - 2) // LATENCY cycles since a0/b0 issued
       dut.io.yValid.expect(true.B)
       dut.io.y.peek().litValue shouldBe FixedMulRef(rawA0, rawB0)
       dut.clock.step(1)
@@ -129,10 +147,12 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
     io.y := satAdd(io.a, io.b)
   }
 
+  // satAdd registers its exact sum before the clamp: the result is valid satAdd.LATENCY cycles later.
   it should "add normally within range" in {
     test(new SatAddHarness) { dut =>
       dut.io.a.poke(FixedPoint.toFixed(1.5).S)
       dut.io.b.poke(FixedPoint.toFixed(2.25).S)
+      dut.clock.step(satAdd.LATENCY)
       dut.io.y.peek().litValue shouldBe FixedPoint.toFixed(3.75)
     }
   }
@@ -141,6 +161,7 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
     test(new SatAddHarness) { dut =>
       dut.io.a.poke(FixedPoint.MAX.S(32.W))
       dut.io.b.poke(FixedPoint.toFixed(10.0).S)
+      dut.clock.step(satAdd.LATENCY)
       dut.io.y.peek().litValue shouldBe FixedPoint.MAX
     }
   }
@@ -149,6 +170,7 @@ class FixedPointTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
     test(new SatAddHarness) { dut =>
       dut.io.a.poke(FixedPoint.MIN.S(32.W))
       dut.io.b.poke(FixedPoint.toFixed(-10.0).S)
+      dut.clock.step(satAdd.LATENCY)
       dut.io.y.peek().litValue shouldBe FixedPoint.MIN
     }
   }

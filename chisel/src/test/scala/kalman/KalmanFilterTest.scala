@@ -14,7 +14,7 @@ class KalmanFilterTest extends AnyFlatSpec with ChiselScalatestTester with Match
   }
 
   // Drives one Decoupled measurement transaction to completion (blocks until accepted).
-  def sendMeasurement(dut: KalmanFilter, z: Double, seq: Long, maxWait: Int = 60): Unit = {
+  def sendMeasurement(dut: KalmanFilter, z: Double, seq: Long, maxWait: Int = KalmanFilter.latency() + 8): Unit = {
     dut.io.in.bits.z.poke(FixedPoint.toFixed(z).S(32.W))
     dut.io.in.bits.seqNum.poke(seq.U(32.W))
     dut.io.in.bits.valid.poke(true.B)
@@ -29,7 +29,7 @@ class KalmanFilterTest extends AnyFlatSpec with ChiselScalatestTester with Match
     dut.io.in.valid.poke(false.B)
   }
 
-  def waitForOutput(dut: KalmanFilter, maxCycles: Int = 60): Unit = {
+  def waitForOutput(dut: KalmanFilter, maxCycles: Int = KalmanFilter.latency() + 8): Unit = {
     var c = 0
     while (!dut.io.out.valid.peek().litToBoolean && c < maxCycles) {
       dut.clock.step(1)
@@ -72,15 +72,17 @@ class KalmanFilterTest extends AnyFlatSpec with ChiselScalatestTester with Match
       dut.io.in.ready.expect(false.B) // busy the very next cycle
       dut.io.busy.expect(true.B)
 
-      var c = 0
-      while (!dut.io.out.valid.peek().litToBoolean && c < 60) {
+      var c = 1
+      while (!dut.io.out.valid.peek().litToBoolean && c < KalmanFilter.latency() + 8) {
         dut.io.in.ready.expect(false.B, s"ready asserted mid-pipeline at cycle $c")
         dut.clock.step(1)
         c += 1
       }
       dut.io.out.valid.expect(true.B)
-      // busy/ready are registered off `doneValid`, so they only clear the cycle AFTER
-      // the output-valid pulse, not on the same cycle.
+      c shouldBe KalmanFilter.latency() // the bookkeeping constant must match the RTL exactly
+      // busy/ready clear on the commit edge; out.valid is the registered copy one cycle later,
+      // so by the time out.valid is seen the filter is already idle.
+      dut.io.busy.expect(false.B)
       dut.io.in.valid.poke(false.B)
       dut.clock.step(1)
       dut.io.busy.expect(false.B)

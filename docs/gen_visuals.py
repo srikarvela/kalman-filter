@@ -265,10 +265,13 @@ def measured_fmax_mhz():
 
 
 def make_pipeline_latency():
-    # Cumulative cycle counts derived from the design (see KalmanFilter.scala comments):
-    # accept -> stage1Valid (1c) -> predict-P settles (mm1 3c + mm2 3c = 6c from stage1Valid,
-    # predict-x's 2c branch is off the critical path) -> reciprocal (~17c) -> gain (2c) ->
-    # update x/P (2c). Total ~27 cycles @ 250 MHz = 4 ns/cycle.
+    # Cumulative cycle counts from the design's bookkeeping constants (KalmanFilter.latency():
+    # FixedPointMul.LATENCY = 8, satAdd.LATENCY = 1, Matrix2x2FixedMul.LATENCY = 10,
+    # Reciprocal.latency(3) = 67):
+    #   accept -> stage1Valid (1) -> predict-P (mm1 10 + mm2 10 + P_pred satAdd+reg 2 + S satAdd+reg 2 = 24;
+    #   predict-x's 8+2 cycles run in parallel and are off the critical path) -> reciprocal (67)
+    #   -> gain (8) -> update x/P (8 multiply + 1 registered sum, clamped on the commit edge)
+    #   + registered output valid (1) = 110 cycles.
     # Cycle -> ns conversion uses the measured post-route clock from the committed
     # timing report (period - WNS at the 4.000 ns constraint), never the 250 MHz target:
     # the design does not close at 4.000 ns (see README "Synthesis results").
@@ -277,17 +280,17 @@ def make_pipeline_latency():
     clk_label = f"{fmax:.1f} MHz measured post-route Fmax (1 cycle = {ns_per_cycle:.2f} ns)" if fmax else "cycles only (no timing report yet)"
     stages = [
         ("Input\nlatch", 1, CYAN),
-        ("Predict P\n(2x matmul, F.P.F^T+Q)", 5, GREEN),
-        ("Reciprocal\n(Newton-Raphson 1/S)", 17, RED),
-        ("Gain\n(K0,K1)", 2, CYAN),
-        ("Update x/P\n(commit)", 2, GREEN),
+        ("Predict P\n(2x matmul, F.P.F^T+Q, +R)", 24, GREEN),
+        ("Reciprocal\n(Newton-Raphson 1/S)", 67, RED),
+        ("Gain\n(K0,K1)", 8, CYAN),
+        ("Update x/P\n(commit + out)", 10, GREEN),
     ]
 
     fig, ax = plt.subplots(figsize=(13, 4.6), facecolor=DARK)
     ax.set_facecolor(PANEL)
     fig.suptitle(f"Pipeline Stage Latency — {clk_label}",
                  color=WHITE, fontsize=12, fontweight="bold")
-    ax.text(0, 1.05, "Predict x (2c) runs in parallel with Predict P and is off the critical path.",
+    ax.text(0, 1.05, "Predict x (10c) runs in parallel with Predict P and is off the critical path.",
             transform=ax.transAxes, fontsize=8.5, color=GREY)
 
     x = 0
@@ -306,7 +309,7 @@ def make_pipeline_latency():
                 arrowprops=dict(arrowstyle="<->", color=WHITE, lw=1.5))
     ax.text(total / 2, -0.42,
             (f"Total: {total} cycles = {total * ns_per_cycle:.0f} ns @ {fmax:.1f} MHz  " if ns_per_cycle else f"Total: {total} cycles  ")
-            + f"(reciprocal is {17 / total * 100:.0f}% of the critical path)",
+            + f"(reciprocal is {67 / total * 100:.0f}% of the critical path)",
             ha="center", va="top", fontsize=10, color=WHITE, fontweight="bold")
 
     ax.set_xlim(-1, total + 1)

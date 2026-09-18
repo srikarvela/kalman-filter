@@ -6,7 +6,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class ReciprocalTest extends AnyFlatSpec with ChiselScalatestTester with Matchers {
-  def reciprocalOnce(dut: Reciprocal, xVal: Double, maxCycles: Int = 60): Double = {
+  def reciprocalOnce(dut: Reciprocal, xVal: Double, maxCycles: Int = Reciprocal.latency(3) + 8): Double = {
     dut.io.x.poke(FixedPoint.toFixed(xVal).S(32.W))
     dut.io.valid.poke(true.B)
     dut.clock.step(1)
@@ -49,13 +49,13 @@ class ReciprocalTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       dut.io.valid.poke(true.B)
       dut.clock.step(1)
       dut.io.valid.poke(false.B)
-      var latency = 0
-      while (!dut.io.yValid.peek().litToBoolean && latency < 60) {
+      var latency = 1
+      while (!dut.io.yValid.peek().litToBoolean && latency < Reciprocal.latency(3) + 8) {
         dut.clock.step(1)
         latency += 1
       }
       dut.io.yValid.expect(true.B)
-      latency should (be > 0 and be < 60)
+      latency shouldBe Reciprocal.latency(3)
     }
   }
 
@@ -70,7 +70,7 @@ class ReciprocalTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       dut.io.valid.poke(false.B)
 
       var cyclesSinceFirst = 2
-      while (!dut.io.yValid.peek().litToBoolean && cyclesSinceFirst < 60) {
+      while (!dut.io.yValid.peek().litToBoolean && cyclesSinceFirst < Reciprocal.latency(3) + 8) {
         dut.clock.step(1)
         cyclesSinceFirst += 1
       }
