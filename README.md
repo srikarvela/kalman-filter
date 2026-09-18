@@ -29,7 +29,7 @@ This implementation focuses on:
 ✔ ChiselTest suite: 24 cases across all submodules + the full filter
 ✔ Python golden model: floating-point reference + bit-exact Q16.16 emulation of the RTL algorithm
 ✔ End-to-end replay: 200/200 rows bit-exact match between RTL simulation and the golden model
-✔ Out-of-context Vivado synthesis script (`tcl/kalman_synth.tcl`) targeting the same XC7Z020 part as the sibling repo
+✔ Out-of-context Vivado 2024.1 synthesis + place & route (`tcl/kalman_synth.tcl`) on the same XC7Z020 part as the sibling repo, with the post-route reports committed under [reports/](reports) — **the design does not close at the 250 MHz target: setup-limited Fmax is 57 MHz** (see [Synthesis results](#synthesis-results--post-route-timing-and-utilization))
 
 **Not yet built** (see [Roadmap](#roadmap)): on-hardware PYNQ-Z2 integration, and the SystemVerilog / SpinalHDL / Amaranth ports.
 
@@ -132,25 +132,44 @@ That means downstream stages never need `ShiftRegister` realignment against upst
 
 | Metric | Value |
 |---|---|
-| Clock target | 250 MHz (4 ns period), matching the sibling repo |
-| Pipeline latency | ~27 cycles per accepted measurement (~108 ns) |
-| Long pole | the Newton-Raphson reciprocal (~17 of the 27 cycles) |
+| Clock constraint | 250 MHz (4.000 ns period), matching the sibling repo — **not met**, see below |
+| Achieved clock (post-route, setup-limited) | **57.1 MHz** at the 4.000 ns constraint (WNS −13.516 ns); 56.4 MHz at 3.000 ns |
+| Pipeline latency | ~27 cycles per accepted measurement (≈ 473 ns at 57.1 MHz; it would be ~108 ns if 250 MHz were met) |
+| Long pole (cycles) | the Newton-Raphson reciprocal (~17 of the 27 cycles) |
+| Long pole (timing) | a register-to-register path through two saturating adders into a single-cycle 32×32 multiply (16.0 ns, 25 logic levels) |
 | Throughput | 1 measurement per ~27 cycles (loop-carried, not II=1) |
-| Target device | Zynq XC7Z020 (PYNQ-Z2), out-of-context synthesis |
+| Target device | Zynq XC7Z020 (PYNQ-Z2), out-of-context synthesis + place & route |
 
-~108 ns per update is far faster than realistic order-book update rates, so the lack of II=1 throughput is a non-issue in practice.
+Even at the measured 57 MHz, ~0.5 µs per update is far faster than realistic order-book update rates, so the lack of II=1 throughput is a non-issue in practice; the missed 250 MHz target is a real result and is discussed below.
 
 <p align="center">
   <img src="docs/previews/pipeline_latency.png" alt="Pipeline stage latency breakdown" width="90%" />
 </p>
 
-The reciprocal alone accounts for roughly two-thirds of the total latency — a direct, visible consequence of choosing three Newton-Raphson iterations. Fewer iterations would shorten the critical path at the cost of precision (each iteration currently doubles the number of correct bits, well past what Q16.16 needs); this is the one knob in the design with a clear latency/precision tradeoff.
+The reciprocal alone accounts for roughly two-thirds of the total cycle count — a direct, visible consequence of choosing three Newton-Raphson iterations. Fewer iterations would shorten the pipeline at the cost of precision (each iteration currently doubles the number of correct bits, well past what Q16.16 needs); this is the one knob in the design with a clear latency/precision tradeoff. The nanosecond figures in the chart use the measured post-route clock from `reports/N_4.000ns/timing_summary.rpt`, not the 250 MHz target.
+
+---
+
+## Synthesis results — post-route timing and utilization
+
+Vivado 2024.1, xc7z020clg400-1 (PYNQ-Z2 part), out-of-context, **post-route** (`synth_design -mode out_of_context`, `opt_design`, `place_design`, `phys_opt_design`, `route_design`). Fmax = 1 / (period − WNS), i.e. the setup-limited clock derived from post-route slack, the same way the sibling cordic-engine repo reports it. `make vm-sweep` (or `make kf-sweep` with a native Vivado) regenerates the reports and `scripts/ppa_table.py` builds this table and [reports/ppa.csv](reports/ppa.csv) directly from the committed `utilization.rpt` / `timing_summary.rpt` files in [reports/](reports) — no number here comes from anywhere else. Each row is one place-and-route run of the same RTL (`chisel/generated/KalmanFilter.v`, regenerated from the Chisel sources before the run) at the clock constraint in its `period (ns)` column.
+
+| run | Slice LUTs (logic + mem) | FF | CARRY4 | DSP | BRAM | period (ns) | WNS (ns) / failing | WHS (ns) / failing | constraints met | Fmax (MHz) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| N_4.000ns | 4338 (4310 + 28) | 2279 | 1181 | 116 | 0 | 4.000 | −13.516 / 8027 | −0.002 / 17 | no | 57.1 |
+| N_3.000ns | 4344 (4316 + 28) | 2306 | 1181 | 116 | 0 | 3.000 | −14.729 / 8241 | −0.002 / 4 | no | 56.4 |
 
 <p align="center">
-  <img src="docs/previews/utilization.png" alt="FPGA Resource Utilization" width="90%" />
+  <img src="docs/previews/utilization.png" alt="FPGA Resource Utilization (post-route, 4.000 ns constraint)" width="90%" />
 </p>
 
-Vivado isn't installed in the environment this was built in, so `tcl/kalman_synth.tcl` has not yet been run for real — the utilization chart above is an explicit "pending synthesis" placeholder, not a fabricated estimate. Run `make synth` with Vivado available to populate it from a real `vivado/utilization.rpt`.
+**Reading the table.**
+
+- **Setup is not met at either constraint, by a wide margin.** At 4.000 ns the worst setup slack is −13.516 ns with 8027 of 9261 endpoints failing (TNS −38 833 ns); at 3.000 ns it is −14.729 ns. Both runs give the same answer for the setup-limited clock: **≈ 57 MHz**, not 250 MHz. The 3.000 ns run was made only to check that the Fmax derivation is stable under a tighter constraint (it is: 56.4 vs 57.1 MHz).
+- **Why.** The worst path in both reports is register-to-register, `x0_reg` → `k1YMul/prodReg_reg/PCIN` (4.000 ns) and `x0_reg` → `k0YMul/prodReg_reg/PCIN` (3.000 ns): 16.0 ns of data-path delay over 25–26 logic levels (19–20 CARRY4 + a DSP48E1). It is the structural-pipeline shortcut described above taken literally: `xPred0 = satAdd(x0, dt·x1)` and `yInnov = satAdd(z, −xPred0)` are combinational, and they feed `FixedPointMul`, whose first stage computes the full 64-bit product of two 32-bit operands in a single cycle (four cascaded DSP48E1s, 116 DSPs in total). Two saturating adders (33-bit carry chain + compare + clamp each) plus an unpipelined 32×32 multiply is ~16 ns on a −1 speed-grade Zynq-7020. Closing 250 MHz would need the multiplier split across 3–4 DSP pipeline stages (Vivado's own DSP48 `MREG`/`PREG` registers) and registers between the adder chain and the multiplier inputs, i.e. a few more cycles of latency; that re-pipelining has **not** been done and is not claimed here.
+- **Hold is not met either, marginally.** 17 endpoints (4.000 ns) / 4 endpoints (3.000 ns) fail at −0.002 ns worst slack. Every one of the 30 worst hold paths in `reports/N_*ns/hold_paths.rpt` (`report_timing -hold -max_paths 30`) runs from a config input port into its input register (`io_cfg_q0/q1/r` → `q0Reg/q1Reg/rReg`), which is the ideal-clock artifact of out-of-context analysis: a 0.500 ns input delay against a clock path with no global buffer or insertion delay. It would not survive a real clock network and board-derived input constraints, but that has not been demonstrated, so hold closure is **not claimed**.
+- **Overall: `report_timing_summary` states "Timing constraints are not met"** for both runs. The correct summary of this design's timing today is: 4338 LUTs / 2279 FFs / 116 DSPs / 0 BRAM, setup-limited Fmax ≈ 57 MHz, hold marginally failing on OOC input-port paths.
+- The routed checkpoints (`build/kalman_<period>ns_routed.dcp`) are kept locally (gitignored) so further paths can be queried without re-running the flow.
 
 ---
 
@@ -202,8 +221,10 @@ One genuinely useful bug this caught: a directed convergence test initially look
 | `chisel/src/main/scala/kalman/KalmanFilter.scala` | Top-level structural predict/innovate/gain/update pipeline |
 | `golden/kalman_ref.py` | `KalmanFilterRef` (floating-point) + `KalmanFilterFixedRef` (bit-exact Q16.16 emulation) |
 | `golden/diff_kalman.py` | Bit-exact hardware-vs-golden CSV diff |
-| `tcl/kalman_synth.tcl` | Out-of-context Vivado synth + place + route, targeting XC7Z020 @ 250 MHz |
-| `docs/gen_visuals.py` | Generates all six README figures (format diagram, architecture, latency, signal overlay, demo, utilization) from real verified vectors |
+| `tcl/kalman_synth.tcl` | Out-of-context Vivado synth + place + route on XC7Z020 at the XDC's 4.000 ns constraint (or `-tclargs period:<ns>`), writing `reports/N_<period>ns/` |
+| `scripts/vivado_in_parallels.sh` | Runs the Tcl flow inside a Parallels Windows VM from macOS (Apple Silicon can't run Vivado natively), one Vivado process per period |
+| `scripts/ppa_table.py` | Builds `reports/ppa.csv` and the table above from the committed `.rpt` files |
+| `docs/gen_visuals.py` | Generates all six README figures (format diagram, architecture, latency, signal overlay, demo, utilization) from real verified vectors and the committed reports |
 
 ---
 
@@ -215,8 +236,10 @@ One genuinely useful bug this caught: a directed convergence test initially look
 # Tier 1: simulation (chisel tests + golden model + bit-exact replay diff)
 make sim
 
-# Tier 2: synthesis (requires Vivado)
-make synth
+# Tier 2: synthesis (requires Vivado 2024.1; native, or in a Parallels Windows VM from macOS)
+make synth            # 4.000 ns constraint -> reports/N_4.000ns/, reports/ppa.csv
+make kf-sweep         # 4.000 and 3.000 ns
+make vm-sweep         # the same two, driven into the Parallels VM
 
 # Regenerate README visuals from the latest vectors/synth output
 make kf-visuals
@@ -246,8 +269,14 @@ kalman-filter/
     test_kalman_golden.py       validates the golden model itself
     diff_kalman.py               bit-exact hardware-vs-golden diff
   vectors/                       generated CSVs (gitignored, regenerate via `make kf-golden`)
-  tcl/kalman_synth.tcl           out-of-context Vivado synthesis
+  tcl/kalman_synth.tcl           out-of-context Vivado synthesis + place & route
   constraints/kalman_clock.xdc
+  scripts/
+    vivado_in_parallels.sh       Vivado-in-Parallels runner (macOS -> Windows VM)
+    ppa_table.py                 reports/*.rpt -> reports/ppa.csv
+  reports/                       committed post-route reports
+    N_4.000ns/, N_3.000ns/       timing_summary.rpt, utilization.rpt, hold_paths.rpt
+    ppa.csv
   docs/
     gen_visuals.py
     previews/                    fixed_point_format.png, architecture_block_diagram.png,

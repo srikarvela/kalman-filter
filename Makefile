@@ -34,11 +34,28 @@ sim: kf-test kf-test-replay kf-golden-test
 kf-verilog:
 	cd chisel && $(SBT) --batch "runMain kalman.KalmanFilterVerilog"
 
+# One OOC synth + P&R run per clock period -> reports/N_<period>ns/{timing_summary,utilization,hold_paths}.rpt
+PERIODS ?= 4.000 3.000
+
 .PHONY: kf-synth
 kf-synth: kf-verilog
-	$(VIVADO) -mode batch -source tcl/kalman_synth.tcl
-	@echo "=== Timing report: vivado/timing_summary.rpt ==="
-	@echo "=== Utilization:   vivado/utilization.rpt    ==="
+	$(VIVADO) -mode batch -nolog -nojournal -source tcl/kalman_synth.tcl
+	$(PYTHON) scripts/ppa_table.py
+
+.PHONY: kf-sweep
+kf-sweep: kf-verilog
+	for p in $(PERIODS); do $(VIVADO) -mode batch -nolog -nojournal -source tcl/kalman_synth.tcl -tclargs period:$$p; done
+	$(PYTHON) scripts/ppa_table.py
+
+# Same two, driven from macOS into a Parallels Windows VM running Vivado (Apple Silicon)
+.PHONY: vm-synth vm-sweep
+vm-synth: kf-verilog
+	./scripts/vivado_in_parallels.sh 4.000
+	$(PYTHON) scripts/ppa_table.py
+
+vm-sweep: kf-verilog
+	./scripts/vivado_in_parallels.sh $(PERIODS)
+	$(PYTHON) scripts/ppa_table.py
 
 .PHONY: synth
 synth: kf-synth
@@ -54,7 +71,7 @@ kf-visuals:
 .PHONY: clean
 clean:
 	rm -rf chisel/generated chisel/target chisel/project/target chisel/test_run_dir
-	rm -rf vivado
+	rm -rf vivado build
 	rm -f vectors/*.csv
 
 .PHONY: all

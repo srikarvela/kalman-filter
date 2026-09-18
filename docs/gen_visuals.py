@@ -33,7 +33,7 @@ from matplotlib.ticker import FuncFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VECTORS = os.path.join(HERE, "..", "vectors")
-VIVADO = os.path.join(HERE, "..", "vivado")
+REPORTS = os.path.join(HERE, "..", "reports", "N_4.000ns")  # committed post-route reports (tcl/kalman_synth.tcl)
 OUT = os.path.join(HERE, "previews")
 os.makedirs(OUT, exist_ok=True)
 
@@ -251,11 +251,30 @@ def make_architecture_block_diagram():
 # 3. PIPELINE LATENCY BREAKDOWN
 # ─────────────────────────────────────────────────────────────────────────────
 
+def measured_fmax_mhz():
+    """Setup-limited Fmax = 1000 / (period - WNS) from reports/N_4.000ns/timing_summary.rpt, or None."""
+    path = os.path.join(HERE, "..", "reports", "N_4.000ns", "timing_summary.rpt")
+    if not os.path.exists(path):
+        return None
+    text = open(path).read()
+    clk = re.search(r"^clock\s+\{\d+\.\d+\s+\d+\.\d+\}\s+([\d.]+)\s", text, re.M)
+    wns = re.search(r"^Setup\s*:\s*\d+\s+Failing Endpoints,\s+Worst Slack\s+(-?[\d.]+)ns", text, re.M)
+    if not (clk and wns):
+        return None
+    return 1000.0 / (float(clk.group(1)) - float(wns.group(1)))
+
+
 def make_pipeline_latency():
     # Cumulative cycle counts derived from the design (see KalmanFilter.scala comments):
     # accept -> stage1Valid (1c) -> predict-P settles (mm1 3c + mm2 3c = 6c from stage1Valid,
     # predict-x's 2c branch is off the critical path) -> reciprocal (~17c) -> gain (2c) ->
     # update x/P (2c). Total ~27 cycles @ 250 MHz = 4 ns/cycle.
+    # Cycle -> ns conversion uses the measured post-route clock from the committed
+    # timing report (period - WNS at the 4.000 ns constraint), never the 250 MHz target:
+    # the design does not close at 4.000 ns (see README "Synthesis results").
+    fmax = measured_fmax_mhz()
+    ns_per_cycle = 1000.0 / fmax if fmax else None
+    clk_label = f"{fmax:.1f} MHz measured post-route Fmax (1 cycle = {ns_per_cycle:.2f} ns)" if fmax else "cycles only (no timing report yet)"
     stages = [
         ("Input\nlatch", 1, CYAN),
         ("Predict P\n(2x matmul, F.P.F^T+Q)", 5, GREEN),
@@ -266,7 +285,7 @@ def make_pipeline_latency():
 
     fig, ax = plt.subplots(figsize=(13, 4.6), facecolor=DARK)
     ax.set_facecolor(PANEL)
-    fig.suptitle("Pipeline Stage Latency — 250 MHz clock (1 cycle = 4 ns)",
+    fig.suptitle(f"Pipeline Stage Latency — {clk_label}",
                  color=WHITE, fontsize=12, fontweight="bold")
     ax.text(0, 1.05, "Predict x (2c) runs in parallel with Predict P and is off the critical path.",
             transform=ax.transAxes, fontsize=8.5, color=GREY)
@@ -276,7 +295,8 @@ def make_pipeline_latency():
         ax.barh(0, cycles, left=x, height=0.55, color=color, alpha=0.8,
                 edgecolor=DARK, linewidth=1.5)
         cx = x + cycles / 2
-        ax.text(cx, 0, f"{cycles}c\n{cycles * 4} ns", ha="center", va="center", fontsize=9,
+        ax.text(cx, 0, f"{cycles}c\n{cycles * ns_per_cycle:.0f} ns" if ns_per_cycle else f"{cycles}c",
+                ha="center", va="center", fontsize=9,
                 color=DARK if color in (GREEN, CYAN) else WHITE, fontweight="bold")
         ax.text(cx, 0.35, label, ha="center", va="bottom", fontsize=7.8, color=color)
         x += cycles
@@ -285,8 +305,8 @@ def make_pipeline_latency():
     ax.annotate("", xy=(total, -0.32), xytext=(0, -0.32),
                 arrowprops=dict(arrowstyle="<->", color=WHITE, lw=1.5))
     ax.text(total / 2, -0.42,
-            f"Total: {total} cycles = {total * 4} ns @ 250 MHz  "
-            f"(reciprocal is {17 / total * 100:.0f}% of the critical path)",
+            (f"Total: {total} cycles = {total * ns_per_cycle:.0f} ns @ {fmax:.1f} MHz  " if ns_per_cycle else f"Total: {total} cycles  ")
+            + f"(reciprocal is {17 / total * 100:.0f}% of the critical path)",
             ha="center", va="top", fontsize=10, color=WHITE, fontweight="bold")
 
     ax.set_xlim(-1, total + 1)
@@ -477,7 +497,7 @@ def parse_utilization_rpt(path):
 
 
 def make_utilization():
-    rpt_path = os.path.join(VIVADO, "utilization.rpt")
+    rpt_path = os.path.join(REPORTS, "utilization.rpt")
     resources = parse_utilization_rpt(rpt_path) if os.path.exists(rpt_path) else None
 
     fig, ax = plt.subplots(figsize=(11, 5), facecolor=DARK)
@@ -491,7 +511,7 @@ def make_utilization():
                 ha="center", va="center", fontsize=12, color=YELLOW, transform=ax.transAxes)
         ax.text(0.5, 0.42,
                 "Run `make synth` with Vivado installed to populate this chart from a\n"
-                "real vivado/utilization.rpt -- no placeholder/estimated numbers are shown here.",
+                "real reports/N_4.000ns/utilization.rpt -- no placeholder/estimated numbers are shown here.",
                 ha="center", va="center", fontsize=9.5, color=GREY, transform=ax.transAxes)
         fig.savefig(f"{OUT}/utilization.png", dpi=150, bbox_inches="tight", facecolor=DARK)
         plt.close(fig)
@@ -503,7 +523,7 @@ def make_utilization():
     avail = [v[1] for v in resources.values()]
     pct = [u / a * 100 if a else 0 for u, a in zip(used, avail)]
 
-    fig.suptitle("FPGA Resource Utilization  —  XC7Z020  (Zynq-7020, PYNQ-Z2, real synth)",
+    fig.suptitle("FPGA Resource Utilization  —  XC7Z020  (Zynq-7020, PYNQ-Z2, post-route, 4.000 ns constraint)",
                  color=WHITE, fontsize=12, fontweight="bold")
     y = range(len(labels))
     colors = [GREEN if p < 40 else YELLOW if p < 70 else RED for p in pct]
@@ -522,7 +542,7 @@ def make_utilization():
 
     fig.savefig(f"{OUT}/utilization.png", dpi=150, bbox_inches="tight", facecolor=DARK)
     plt.close(fig)
-    print("utilization.png done (from real vivado/utilization.rpt)")
+    print("utilization.png done (from reports/N_4.000ns/utilization.rpt)")
 
 
 if __name__ == "__main__":

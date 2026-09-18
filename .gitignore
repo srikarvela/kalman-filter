@@ -8,8 +8,13 @@ chisel/project/project/
 chisel/generated/
 chisel/test_run_dir/
 
-# Vivado project output
+# Vivado project output (reports/ is committed; the routed checkpoint is not)
 vivado/
+build/
+*.dcp
+*.jou
+*.log
+.Xil/
 
 # Python
 __pycache__/
